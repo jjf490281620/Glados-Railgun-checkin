@@ -1,6 +1,7 @@
 """Run independent GLaDOS / Railgun check-ins and report real failures to CI."""
 
 import html
+import hashlib
 import json
 import os
 import re
@@ -23,6 +24,7 @@ DOMAINS = ("glados.cloud", "railgun.info")
 class CheckinStatus(Enum):
     SUCCESS = 0
     REPEAT = 1
+    REQUIRES_BROWSER = 2
     FAILURE = -2
 
 
@@ -117,6 +119,11 @@ class Config:
 class APIError(Exception):
     """A safe diagnostic that never contains request headers or response bodies."""
 
+    def __init__(self, message: str, http_status=None, browser_required=False):
+        super().__init__(message)
+        self.http_status = http_status
+        self.browser_required = browser_required
+
 
 @dataclass(frozen=True)
 class UserStatus:
@@ -158,12 +165,12 @@ class API:
     def __exit__(self, exc_type, exc_value, traceback):
         self.session.close()
 
-    def _request(self, path: str, method="GET", data=None) -> dict:
-        attempts = 3
+    def _request(self, path: str, method="GET", data=None, retry=True) -> dict:
+        attempts = 3 if retry else 1
         for attempt in range(attempts):
             try:
                 response = self.session.request(
-                    method, f"https://{self.domain}{path}", data=data,
+                    method, f"https://{self.domain}{path}", json=data,
                     timeout=(10, 30), allow_redirects=False,
                 )
             except requests.RequestException as error:
@@ -176,7 +183,7 @@ class API:
                 time.sleep(2 ** attempt)
                 continue
             if not 200 <= response.status_code < 300:
-                raise APIError(f"接口返回 HTTP {response.status_code}；请检查域名、Cookie 或稍后重试。")
+                raise APIError(f"接口返回 HTTP {response.status_code}；请检查域名、Cookie 或稍后重试。", http_status=response.status_code)
             try:
                 payload = response.json()
             except ValueError:
@@ -186,9 +193,44 @@ class API:
             return payload
         raise APIError("网络请求失败。")
 
+    def _get_checkin_nonce(self) -> Optional[str]:
+        try:
+            challenge = self._request("/api/user/checkin/challenge")
+        except APIError as error:
+            if error.http_status == 404:
+                return None
+            raise
+        if challenge.get("code") != 0:
+            raise APIError(display_text(challenge.get("message"), "无法获取签到校验请求。"))
+        if challenge.get("turnstile"):
+            raise APIError(
+                "网站要求完成 Cloudflare Turnstile 网页验证；当前 GitHub 接口任务无法完成本次签到。请在官网登录并检查签到页。",
+                browser_required=True,
+            )
+        nonce = challenge.get("nonce")
+        if not isinstance(nonce, str) or not nonce:
+            raise APIError("签到接口未返回有效的校验请求。")
+        ttl = number(challenge.get("ttl"))
+        if ttl is not None and ttl <= 2500:
+            raise APIError("签到校验请求有效期过短，请稍后重试。")
+        register_secret(nonce)
+        return nonce
+
     def checkin(self) -> dict:
-        # Check-in is idempotent: a retried successful request returns code 1.
-        return self._request("/api/user/checkin", "POST", {"token": self.domain})
+        nonce = self._get_checkin_nonce()
+        payload = {"token": self.domain}
+        if nonce:
+            # Follow the web client's protocol when browser verification is
+            # not required. Never synthesize a Turnstile token.
+            time.sleep(2.5)
+            payload.update({
+                "nonce": nonce,
+                "proof": hashlib.sha256((nonce + ".glados-observe-v1").encode("utf-8")).hexdigest(),
+                "tsState": "off",
+            })
+        # A nonce is single-use; a later run obtains a fresh one if the response
+        # is lost. Older endpoints without challenges retain bounded retries.
+        return self._request("/api/user/checkin", "POST", payload, retry=nonce is None)
 
     def get_status(self) -> UserStatus:
         payload = self._request("/api/user/status")
@@ -214,6 +256,7 @@ class CheckinResult:
     account: str
     domain: str
     email: str = ""
+    identity_verified: bool = False
     code: CheckinStatus = CheckinStatus.FAILURE
     points: str = "0"
     days: str = "未知"
@@ -235,6 +278,7 @@ class CheckinResult:
         return {
             CheckinStatus.SUCCESS: "✅ 签到成功",
             CheckinStatus.REPEAT: "🔄 今日已签到",
+            CheckinStatus.REQUIRES_BROWSER: "⚠️ 需要网页验证",
             CheckinStatus.FAILURE: "❌ 签到失败",
         }[self.code]
 
@@ -256,12 +300,12 @@ class Checker:
                     # One account must not prevent the others from being checked in.
                     message = str(error) if isinstance(error, APIError) else f"账号处理异常（{type(error).__name__}）"
                     result = CheckinResult(account.name, domain, email=account.email, message=message)
-                if result.ok:
+                if result.ok or result.identity_verified:
                     break
                 failures.append(f"{domain}：{result.message}")
                 logger.warning("[%s][%s] %s", account.name, domain, result.message)
 
-            if not result.ok:
+            if not result.ok and not result.identity_verified:
                 result.domain = " / ".join(account.domains)
                 result.message = "；".join(failures)
             self.results.append(result)
@@ -278,16 +322,30 @@ class Checker:
                 return result
             result.email = status.email
             result.days = status.days
-            payload = api.checkin()
+            result.identity_verified = True
+            try:
+                result.points_total, _ = api.get_points()
+            except APIError as error:
+                logger.warning("[%s][%s] %s", result.identifier, domain, error)
+            try:
+                payload = api.checkin()
+            except APIError as error:
+                result.message = str(error)
+                if error.browser_required:
+                    result.code = CheckinStatus.REQUIRES_BROWSER
+                return result
             code = payload.get("code")
             result.message = display_text(payload.get("message"), "接口未返回消息")
             if isinstance(code, bool) or code not in (0, 1):
+                if payload.get("reason") in ("turnstile", "device-mismatch"):
+                    result.code = CheckinStatus.REQUIRES_BROWSER
+                    result.message += "（网站要求在登录对应账号的浏览器中完成验证）"
                 if code == -2 or "permission" in result.message.lower() or "权限" in result.message:
                     result.message += "（Cookie 未通过认证，请重新登录后更新 Secret）"
                 return result
 
-            result.code = CheckinStatus(code)
-            result.points = display_text(payload.get("points", 0), "0") if code == 0 else "0"
+            result.code = CheckinStatus.REPEAT if code == 1 or payload.get("repeated") is True else CheckinStatus.SUCCESS
+            result.points = display_text(payload.get("points", 0), "0") if result.code == CheckinStatus.SUCCESS else "0"
             if self.config.verbose:
                 logger.info("[%s][%s] 接口消息：%s", result.identifier, domain, result.message)
 
@@ -301,10 +359,10 @@ class Checker:
                     result.days = updated_status.days
                 except APIError as error:
                     logger.warning("[%s][%s] 签到后状态查询失败：%s", result.identifier, domain, error)
-            try:
-                result.points_total, _ = api.get_points()
-            except APIError as error:
-                logger.warning("[%s][%s] %s", result.identifier, domain, error)
+                try:
+                    result.points_total, _ = api.get_points()
+                except APIError as error:
+                    logger.warning("[%s][%s] %s", result.identifier, domain, error)
         return result
 
     @property

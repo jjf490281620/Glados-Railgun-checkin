@@ -150,16 +150,18 @@ class AccountExecutionTests(CheckinTestCase):
         self.assertEqual((result.points, result.days, result.points_total), ("3", "25 天", "99"))
         self.assertEqual(result.email, "one@example.com")
 
-    def test_failed_checkin_skips_balance(self):
+    def test_failed_checkin_retains_verified_email_and_balance(self):
         checker = Checker(self.config(cookies=cookie("one")))
         with patch("checkin.API") as client:
             api = client.return_value.__enter__.return_value
             api.get_status.return_value = UserStatus("one@example.com", "25 天")
+            api.get_points.return_value = ("99", 99)
             api.checkin.return_value = {"code": -2, "message": "No permission"}
             result = checker._checkin_on_domain(checker.config.accounts[0], "glados.cloud")
             api.get_status.assert_called_once()
-            api.get_points.assert_not_called()
+            api.get_points.assert_called_once()
         self.assertFalse(result.ok)
+        self.assertEqual(result.points_total, "99")
         self.assertIn("更新 Secret", result.message)
 
     def test_email_mismatch_prevents_checkin(self):
@@ -204,6 +206,38 @@ class AccountExecutionTests(CheckinTestCase):
             result = checker._checkin_on_domain(checker.config.accounts[0], "glados.cloud")
         self.assertTrue(result.ok)
 
+    def test_browser_verification_preserves_identity_and_does_not_try_other_domain(self):
+        checker = Checker(self.config(accounts=[{"cookie": cookie("one"), "email": "one@example.com"}]))
+        with patch("checkin.API") as client:
+            api = client.return_value.__enter__.return_value
+            api.get_status.return_value = UserStatus("one@example.com", "25 天")
+            api.get_points.return_value = ("99", 99)
+            api.checkin.side_effect = APIError("需要完成网页验证", browser_required=True)
+            checker.checkin_all()
+            client.assert_called_once()
+        result = checker.results[0]
+        self.assertEqual(result.code, CheckinStatus.REQUIRES_BROWSER)
+        self.assertEqual((result.email, result.days, result.points_total, result.domain), ("one@example.com", "25 天", "99", "glados.cloud"))
+        self.assertIn("网页验证", result.message)
+        self.assertTrue(checker.has_failures)
+
+    def test_new_repeated_response_is_reported_as_already_checked_in(self):
+        checker = Checker(self.config(cookies=cookie("one")))
+        with patch("checkin.API") as client:
+            api = client.return_value.__enter__.return_value
+            api.get_status.return_value = UserStatus("one@example.com", "25 天")
+            api.get_points.return_value = ("99", 99)
+            api.checkin.return_value = {"code": 0, "repeated": True, "points": 0}
+            result = checker._checkin_on_domain(checker.config.accounts[0], "glados.cloud")
+        self.assertEqual(result.code, CheckinStatus.REPEAT)
+        self.assertEqual(result.points, "0")
+
+    def test_browser_verification_does_not_report_a_successful_workflow(self):
+        self.config(cookies=cookie("one"))
+        result = CheckinResult("账号 1", "glados.cloud", code=CheckinStatus.REQUIRES_BROWSER, identity_verified=True)
+        with patch.object(Checker, "_checkin_on_domain", return_value=result):
+            self.assertEqual(checkin.main(), 1)
+
 
 class TransportTests(CheckinTestCase):
     def response(self, status=200, payload=None):
@@ -214,15 +248,15 @@ class TransportTests(CheckinTestCase):
             self.assertIsNot(first.session, second.session)
             self.assertEqual(first.session.headers["Cookie"], cookie("one"))
             self.assertEqual(second.session.headers["Cookie"], cookie("two"))
-            with patch.object(first.session, "request", return_value=self.response()) as request:
+            with patch.object(first, "_get_checkin_nonce", return_value=None), patch.object(first.session, "request", return_value=self.response()) as request:
                 first.checkin()
-            self.assertEqual(request.call_args.kwargs["data"], {"token": "glados.cloud"})
+            self.assertEqual(request.call_args.kwargs["json"], {"token": "glados.cloud"})
             self.assertFalse(request.call_args.kwargs["allow_redirects"])
             self.assertEqual(request.call_args.kwargs["timeout"], (10, 30))
 
     def test_transient_server_errors_are_retried(self):
         with API(Account("one", cookie("one")), "glados.cloud") as api:
-            with patch.object(api.session, "request", side_effect=[self.response(503), self.response()]) as request, patch("checkin.time.sleep"):
+            with patch.object(api, "_get_checkin_nonce", return_value=None), patch.object(api.session, "request", side_effect=[self.response(503), self.response()]) as request, patch("checkin.time.sleep"):
                 self.assertEqual(api.checkin()["code"], 0)
                 self.assertEqual(request.call_count, 2)
 
@@ -233,6 +267,41 @@ class TransportTests(CheckinTestCase):
                     api.checkin()
                 self.assertEqual(request.call_count, 3)
                 self.assertNotIn(cookie("one"), str(raised.exception))
+
+    def test_current_challenge_protocol_submits_nonce_and_proof_as_json(self):
+        challenge = self.response(payload={"code": 0, "nonce": "sample-nonce", "ttl": 300000, "turnstile": None})
+        with API(Account("one", cookie("one")), "glados.cloud") as api:
+            with patch.object(api.session, "request", side_effect=[challenge, self.response()]) as request, patch("checkin.time.sleep") as wait:
+                self.assertEqual(api.checkin()["code"], 0)
+                payload = request.call_args.kwargs["json"]
+                self.assertEqual(payload["nonce"], "sample-nonce")
+                self.assertEqual(payload["proof"], "67851acd026743579f8c37b98a962b0b0a1b9cbb4688f1167f0219b2de1e9745")
+                self.assertEqual(payload["tsState"], "off")
+                wait.assert_called_once_with(2.5)
+
+    def test_required_turnstile_stops_before_submitting_checkin(self):
+        challenge = self.response(payload={"code": 0, "nonce": "sample-nonce", "turnstile": "public-site-key"})
+        with API(Account("one", cookie("one")), "glados.cloud") as api:
+            with patch.object(api.session, "request", return_value=challenge) as request:
+                with self.assertRaises(APIError) as raised:
+                    api.checkin()
+                request.assert_called_once()
+                self.assertEqual(request.call_args.args[0], "GET")
+        self.assertTrue(raised.exception.browser_required)
+
+    def test_older_domain_without_challenge_endpoint_still_checks_in(self):
+        with API(Account("one", cookie("one")), "railgun.info") as api:
+            with patch.object(api.session, "request", side_effect=[self.response(404), self.response()]) as request:
+                self.assertEqual(api.checkin()["code"], 0)
+                self.assertEqual(request.call_args.kwargs["json"], {"token": "railgun.info"})
+
+    def test_single_use_nonce_is_not_retried_after_submission_timeout(self):
+        challenge = self.response(payload={"code": 0, "nonce": "sample-nonce", "ttl": 300000})
+        with API(Account("one", cookie("one")), "glados.cloud") as api:
+            with patch.object(api.session, "request", side_effect=[challenge, requests.Timeout()]) as request, patch("checkin.time.sleep"):
+                with self.assertRaises(APIError):
+                    api.checkin()
+                self.assertEqual(request.call_count, 2)
 
     def test_status_requires_email_to_identify_the_account(self):
         with API(Account("one", cookie("one")), "glados.cloud") as api:
