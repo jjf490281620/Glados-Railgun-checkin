@@ -110,6 +110,8 @@ class Config:
     def __init__(self):
         self.push_key = os.environ.get("PUSHDEER_SENDKEY", "").strip()
         self.verbose = os.environ.get("GLADOS_VERBOSE", "").strip().lower() in ("true", "1", "yes", "y")
+        self.browser_fallback = os.environ.get("GLADOS_BROWSER_FALLBACK", "false").strip().lower() in ("true", "1", "yes", "y")
+        self.browser_headless = os.environ.get("GLADOS_BROWSER_HEADLESS", "true").strip().lower() in ("true", "1", "yes", "y")
         raw = os.environ.get("GLADOS_ACCOUNTS", "").strip()
         source = "GLADOS_ACCOUNTS"
         if not raw:
@@ -294,6 +296,7 @@ class CheckinResult:
     days: str = "未知"
     points_total: str = "未知"
     message: str = ""
+    method: str = "接口"
 
     @property
     def identifier(self) -> str:
@@ -368,6 +371,22 @@ class Checker:
                 if error.browser_required:
                     result.code = CheckinStatus.REQUIRES_BROWSER
                 return result
+            if self.config.browser_fallback and (
+                payload.get("reason") == "turnstile"
+                or response_code(payload.get("code")) == 5
+                or any(word in display_text(payload.get("message"), "").lower() for word in ("cloudflare", "turnstile"))
+            ):
+                from browser_checkin import BrowserCheckinError, checkin_in_browser
+
+                logger.info("[%s][%s] 接口要求网页验证，改用独立浏览器会话打开官网签到页。", result.identifier, domain)
+                result.method = "网页"
+                try:
+                    payload = checkin_in_browser(account.cookie, domain, result.email, api.session.headers["User-Agent"], self.config.browser_headless)
+                except BrowserCheckinError as error:
+                    result.message = str(error)
+                    if error.browser_required:
+                        result.code = CheckinStatus.REQUIRES_BROWSER
+                    return result
             code = response_code(payload.get("code"))
             result.message = display_text(payload.get("message"), "接口未返回消息")
             reason = payload.get("reason")
@@ -375,9 +394,13 @@ class Checker:
                 result.code = CheckinStatus.REQUIRES_BROWSER
                 result.message += "（登录设备仍不匹配；请为该账号填写提取 Cookie 时浏览器的 user-agent）"
                 return result
-            if reason == "turnstile" or any(word in result.message.lower() for word in ("cloudflare", "turnstile")):
+            if code == 5 or reason == "turnstile" or any(word in result.message.lower() for word in ("cloudflare", "turnstile")):
                 result.code = CheckinStatus.REQUIRES_BROWSER
-                result.message += "（网站要求在登录对应账号的浏览器中完成网页验证）"
+                result.message += (
+                    "（官网验证组件仍未通过；该账号需要在正常浏览器中完成验证）"
+                    if result.method == "网页"
+                    else "（网站要求在登录对应账号的浏览器中完成网页验证）"
+                )
                 return result
             if "please checkin via" in result.message.lower():
                 result.message += "（服务端要求使用其他签到域名，请核对该账号的 domain）"
@@ -418,7 +441,7 @@ class Checker:
         failures = sum(not result.ok for result in self.results)
         title = f"GLaDOS 签到：成功 {successes}，已签到 {repeats}，失败 {failures}"
         content = "\n".join(
-            f"{result.identifier} [{result.domain}] {result.status} | 剩余 {result.days} | 总积分 {result.points_total}"
+            f"{result.identifier} [{result.domain}] {result.status} | 方式 {result.method} | 剩余 {result.days} | 总积分 {result.points_total}"
             + (f" | {result.message}" if not result.ok else "")
             for result in self.results
         )
@@ -437,11 +460,11 @@ def write_summary(title: str, results: list[CheckinResult], error="") -> None:
     lines = [f"## {markdown_cell(title)}", ""]
     if results:
         lines.extend([
-            "| 账号（邮箱） | 域名 | 结果 | 本次积分 | 剩余天数 | 总积分 |",
-            "| --- | --- | --- | --- | --- | --- |",
+            "| 账号（邮箱） | 域名 | 方式 | 结果 | 本次积分 | 剩余天数 | 总积分 |",
+            "| --- | --- | --- | --- | --- | --- | --- |",
         ])
         for result in results:
-            values = (result.identifier, result.domain, result.status, result.points, result.days, result.points_total)
+            values = (result.identifier, result.domain, result.method, result.status, result.points, result.days, result.points_total)
             lines.append("| " + " | ".join(markdown_cell(value) for value in values) + " |")
         pending = [result for result in results if not result.ok]
         if pending:

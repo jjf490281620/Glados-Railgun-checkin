@@ -66,13 +66,17 @@ jobs:
           cache-dependency-path: requirements.txt
       - name: Install dependencies
         run: python -m pip install -r requirements.txt
+      - name: Install check-in browser
+        run: python -m playwright install --with-deps chromium
       - name: Run multi-account check-in
-        run: python checkin.py
+        run: xvfb-run --auto-servernum python checkin.py
         env:
           PYTHONUNBUFFERED: '1'
           GLADOS_ACCOUNTS: ${{ secrets.GLADOS_ACCOUNTS }}
           GLADOS_COOKIES: ${{ secrets.GLADOS_COOKIES }}
           GLADOS_VERBOSE: ${{ secrets.GLADOS_VERBOSE }}
+          GLADOS_BROWSER_FALLBACK: 'true'
+          GLADOS_BROWSER_HEADLESS: 'false'
           PUSHDEER_SENDKEY: ${{ secrets.PUSHDEER_SENDKEY }}
       - name: Keep scheduled workflow active
         if: always()

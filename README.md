@@ -10,7 +10,9 @@
 
 服务端返回设备不匹配时，未配置 `user-agent` 的账号会按服务端返回的登录平台自动调整一次，并重新获取 nonce 后重试。这样可以处理 Cookie 来自 macOS、脚本默认使用 Windows 标识的情况。账号仍不匹配时，填写复制 Cookie 时浏览器的完整 User-Agent。
 
-服务端明确拒绝签到并要求 Turnstile 时，该账号显示“需要网页验证”，保留已核对的邮箱、剩余天数和积分，工作流返回失败状态并继续处理其他账号。纯接口任务无法完成网页验证码；上游 v1.0.1 另提供[浏览器扩展](https://github.com/Devilstore/Glados-Railgun-checkin/tree/master/extension)，需要浏览器运行，在官网页面由官方组件完成验证。是否允许接口签到以及实际获得多少积分，由网站决定。
+GitHub Actions 已启用网页签到后备流程：接口返回 Turnstile 拒绝时，为该账号创建独立 Chromium 会话，重新核验邮箱，打开官网签到页，再点击官网的签到按钮。官网自行加载验证组件并提交请求，脚本读取真实响应；每个账号的 Cookie 和浏览器会话互相隔离。运行摘要中的“方式”列显示“接口”或“网页”。
+
+如果官网组件仍要求人工验证，该账号保留“需要网页验证”状态，工作流返回失败并继续处理其他账号。浏览器流程不伪造验证令牌、不破解验证码。GitHub 运行器能否自动通过验证由网站决定；需要人工交互时，可在正常浏览器中检查该账号，或使用上游的[浏览器扩展](https://github.com/Devilstore/Glados-Railgun-checkin/tree/master/extension)。
 
 ## 部署
 
@@ -89,11 +91,12 @@ gld:accts=ACCOUNT_2_TOKEN; gld:accts.sig=ACCOUNT_2_ACCOUNTS_SIGNATURE; gld:sess=
 - 临时网络错误、HTTP 429 / 5xx 会有限重试；HTTP 跳转不会自动携带 Cookie 跟随。
 - 新版请求会先获取一次性校验信息；签名请求只提交一次，网络超时后可重新运行工作流获取新的校验信息。
 - 设备不匹配时最多按登录平台恢复一次，每次获取新的校验信息；填写了 `user-agent` 时始终使用该值。
+- 接口返回 Turnstile 拒绝时，自动尝试官网网页；只有服务端确认成功或今日已签到才视为完成。
 - 运行时会对 Cookie 以及 `gld:*` / `koa:*` 会话、账户令牌和签名添加日志遮罩。
 - 使用 GitHub 自带的 `GITHUB_TOKEN` 重新启用当前工作流，防止因仓库长期没有提交导致定时任务被停用；无需额外 PAT。
 - 不自动删除运行日志，便于检查历史结果。
 
-运行摘要包含**账号名称、真实邮箱、域名、签到结果、本次积分、剩余天数、总积分、说明**。Cookie 失效或邮箱不匹配时，该行显示配置邮箱并注明失败原因。
+运行摘要包含**账号名称、真实邮箱、域名、签到方式、签到结果、本次积分、剩余天数、总积分、说明**。Cookie 失效或邮箱不匹配时，该行显示配置邮箱并注明失败原因。
 
 | 脚本退出码 | 含义 |
 | --- | --- |
@@ -127,12 +130,14 @@ python -m unittest discover -s tests -v
 python checkin.py
 ```
 
+本地需要启用网页后备流程时，先执行 `python -m playwright install chromium`，再设置 `GLADOS_BROWSER_FALLBACK=true`。默认使用无界面浏览器；需要可见窗口时设置 `GLADOS_BROWSER_HEADLESS=false`。GitHub Actions 使用 Xvfb 运行带界面的 Chromium，配置已包含在工作流中。
+
 测试使用模拟接口，不需要真实 Cookie，不会执行真实签到或推送。
 
 ## 排查问题
 
 - **“没有权限” / “No permission”**：Cookie 未通过认证。重新登录对应账号，复制新的 Cookie 并更新 Secret；检查配置域名是否与登录站点一致。
-- **“需要网页验证” / “Automated check-in detected”**：网站要求 Turnstile 或登录设备验证。在对应账号的官网签到页检查；纯 GitHub 接口任务无法代替网页验证。
+- **“需要网页验证” / “Cloudflare verification failed”**：查看“方式”列。显示“网页”时，官网组件仍未通过验证，需要在正常浏览器中检查该账号；显示“接口”时，检查网页后备流程是否启用。
 - **“登录设备仍不匹配”**：在该账号 JSON 对象中补充 `user-agent`，填写获取 Cookie 时浏览器 Network → Request Headers 中的完整 User-Agent。
 - **“邮箱不一致”**：Cookie 与配置邮箱属于不同账号；核对该对象的 `email` 和 `cookie`。脚本会在提交签到前拒绝这一账号。
 - **“未返回有效邮箱”**：无法确定当前 Cookie 对应的账号，检查 Cookie 是否完整或网站接口是否变更。
