@@ -1,66 +1,83 @@
-name: auto check
+name: GLaDOS multi-account check-in
 
 on:
   workflow_dispatch:
   push:
-    branches: [ master ]
+    branches: [master]
+    paths-ignore:
+      - 'README.md'
+      - 'imgs/**'
+  pull_request:
+    branches: [master]
     paths-ignore:
       - 'README.md'
       - 'imgs/**'
   schedule:
+    # GitHub cron uses UTC: 12:31 and 15:31 in Asia/Shanghai.
     - cron: '31 4,7 * * *'
 
+permissions:
+  contents: read
+
+concurrency:
+  group: glados-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
-  build:
-    name: glados/railgun checkin
+  test:
+    name: Verify multi-account behavior
     runs-on: ubuntu-latest
-      
+    timeout-minutes: 5
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Run tests without account secrets
+        run: python -m unittest discover -s tests -v
+
+  checkin:
+    name: Check in all accounts
+    needs: test
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: read
       actions: write
-
-    strategy:
-      matrix:
-        python-version: [3.13]
-
-    # 这里加入全局环境变量，强制后续所有第三方 actions 兼容 Node.js 24 运行环境
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-
     steps:
-    - name: Checkout Code
-      uses: actions/checkout@v6
-
-    - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v6
-      with:
-        python-version: ${{ matrix.python-version }}
-
-    # 安装 python 库
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install requests
-        pip install pypushdeer
-
-    # 执行 签到脚本
-    - name: Running checkin
-      run: |
-        python checkin.py
-      env:
-        PUSHDEER_SENDKEY: ${{ secrets.PUSHDEER_SENDKEY }}
-        GLADOS_COOKIES: ${{ secrets.GLADOS_COOKIES }}
-        GLADOS_EXCHANGE_PLAN: ${{ secrets.GLADOS_EXCHANGE_PLAN }}
-        GLADOS_VERBOSE: ${{ secrets.GLADOS_VERBOSE }}
-
-    - name: Keep alive
-      uses: liskin/gh-workflow-keepalive@v1 
-        
-    - name: Delete workflow runs
-      uses: Mattraks/delete-workflow-runs@v2
-      with:
-        token: ${{ github.token }}
-        repository: ${{ github.repository }}
-        retain_days: 7
-        keep_minimum_runs: 7
-        delete_run_by_conclusion_pattern: success
+      - name: Checkout code
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Run multi-account check-in
+        run: python checkin.py
+        env:
+          PYTHONUNBUFFERED: '1'
+          GLADOS_ACCOUNTS: ${{ secrets.GLADOS_ACCOUNTS }}
+          GLADOS_COOKIES: ${{ secrets.GLADOS_COOKIES }}
+          GLADOS_EXCHANGE_PLAN: ${{ secrets.GLADOS_EXCHANGE_PLAN }}
+          GLADOS_VERBOSE: ${{ secrets.GLADOS_VERBOSE }}
+          PUSHDEER_SENDKEY: ${{ secrets.PUSHDEER_SENDKEY }}
+      - name: Keep scheduled workflow active
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api --method PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/gladosCheck.yml/enable"
