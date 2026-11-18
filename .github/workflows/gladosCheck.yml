@@ -43,6 +43,10 @@ jobs:
         run: python -m pip install -r requirements.txt
       - name: Run tests without account secrets
         run: python -m unittest discover -s tests -v
+      - name: Verify browser extension account handling
+        run: |
+          node extension/test-classify.js
+          node extension/test-accounts.js
 
   checkin:
     name: Check in all accounts

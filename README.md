@@ -14,6 +14,8 @@ GitHub Actions 已启用网页签到后备流程：接口返回 Turnstile 拒绝
 
 如果官网组件仍要求人工验证，该账号保留“需要网页验证”状态，工作流返回失败并继续处理其他账号。浏览器流程不伪造验证令牌、不破解验证码。GitHub 运行器能否自动通过验证由网站决定；需要人工交互时，可在正常浏览器中检查该账号，或使用上游的[浏览器扩展](https://github.com/Devilstore/Glados-Railgun-checkin/tree/master/extension)。
 
+本仓库已提供适配好的[本机浏览器扩展](extension/README.md)：可导入同一份账号 JSON，签到前严格核验配置邮箱，并移除了兑换功能。GitHub 浏览器环境无法通过验证时，可由本机正常浏览器完成每日签到，再由 GitHub 定时查询各账号的结果。扩展需要浏览器保持运行。
+
 ## 部署
 
 1. Fork 本仓库，在自己的仓库中启用 **Actions**。
