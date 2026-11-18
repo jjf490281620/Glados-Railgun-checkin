@@ -18,7 +18,6 @@ from logging_config import init_logger, redact_text, register_secret
 
 logger = init_logger()
 DOMAINS = ("glados.cloud", "railgun.info")
-EXCHANGE_PLANS = {"plan100": 100, "plan200": 200, "plan500": 500}
 
 
 class CheckinStatus(Enum):
@@ -32,10 +31,10 @@ class Account:
     name: str
     cookie: str = field(repr=False)
     domains: tuple[str, ...] = DOMAINS
-    exchange_plan: str = "none"
+    email: str = ""
 
 
-def parse_accounts(raw: str, source: str, exchange_plan: str) -> list[Account]:
+def parse_accounts(raw: str, source: str) -> list[Account]:
     """Accept JSON accounts, one cookie per line, or the legacy '&' format."""
     if source == "GLADOS_ACCOUNTS" or raw.lstrip().startswith("["):
         try:
@@ -57,8 +56,8 @@ def parse_accounts(raw: str, source: str, exchange_plan: str) -> list[Account]:
             entry = {"cookie": entry}
         if not isinstance(entry, dict):
             raise ValueError(f"账号 {index} 必须是 Cookie 字符串或账号对象。")
-        if set(entry) - {"name", "cookie", "domain", "exchange_plan"}:
-            raise ValueError(f"账号 {index} 仅支持 name、cookie、domain、exchange_plan 字段。")
+        if set(entry) - {"name", "email", "cookie", "domain"}:
+            raise ValueError(f"账号 {index} 仅支持 name、email、cookie、domain 字段。")
 
         cookie = entry.get("cookie")
         if not isinstance(cookie, str) or not cookie.strip():
@@ -67,7 +66,11 @@ def parse_accounts(raw: str, source: str, exchange_plan: str) -> list[Account]:
         if any(ord(char) < 32 or ord(char) == 127 for char in cookie) or "=" not in cookie:
             raise ValueError(f"账号 {index} 的 Cookie 格式无效；请复制完整 Cookie 请求头的值。")
 
-        name = entry.get("name", f"账号 {index}")
+        email = entry.get("email", "")
+        if not isinstance(email, str) or (email and not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email.strip())):
+            raise ValueError(f"账号 {index} 的 email 必须是有效的邮箱地址。")
+        email = email.strip()
+        name = entry.get("name", email or f"账号 {index}")
         if not isinstance(name, str) or not name.strip() or len(name) > 60 or any(ord(char) < 32 for char in name):
             raise ValueError(f"账号 {index} 的 name 必须是 1–60 字符的单行名称。")
 
@@ -79,16 +82,12 @@ def parse_accounts(raw: str, source: str, exchange_plan: str) -> list[Account]:
             raise ValueError(f"账号 {index} 的 domain 必须是 auto、glados.cloud 或 railgun.info。")
         domains = DOMAINS if domain == "auto" else (domain,)
 
-        plan = entry.get("exchange_plan", exchange_plan)
-        if not isinstance(plan, str) or plan not in ("none", *EXCHANGE_PLANS):
-            raise ValueError(f"账号 {index} 的 exchange_plan 必须是 none、plan100、plan200 或 plan500。")
-
         key = (cookie, domains)
         if key in seen:
             logger.warning("账号 %s 与前面的 Cookie 和域名相同，跳过重复配置。", index)
             continue
         seen.add(key)
-        accounts.append(Account(name.strip(), cookie, domains, plan))
+        accounts.append(Account(name.strip(), cookie, domains, email))
     return accounts
 
 
@@ -96,11 +95,6 @@ class Config:
     def __init__(self):
         self.push_key = os.environ.get("PUSHDEER_SENDKEY", "").strip()
         self.verbose = os.environ.get("GLADOS_VERBOSE", "").strip().lower() in ("true", "1", "yes", "y")
-        plan = os.environ.get("GLADOS_EXCHANGE_PLAN", "").strip() or "none"
-        if plan not in ("none", *EXCHANGE_PLANS):
-            logger.warning("GLADOS_EXCHANGE_PLAN 无效，已关闭自动兑换。")
-            plan = "none"
-
         raw = os.environ.get("GLADOS_ACCOUNTS", "").strip()
         source = "GLADOS_ACCOUNTS"
         if not raw:
@@ -109,19 +103,25 @@ class Config:
         if not raw:
             raise ValueError("未配置账号：请在 GitHub Actions Secrets 中设置 GLADOS_ACCOUNTS 或 GLADOS_COOKIES。")
 
-        self.accounts = parse_accounts(raw, source, plan)
+        self.accounts = parse_accounts(raw, source)
         register_secret(self.push_key)
         for account in self.accounts:
             register_secret(account.cookie)
             for part in account.cookie.split(";"):
                 key, separator, value = part.strip().partition("=")
-                if separator and value and ("sess" in key.lower() or "token" in key.lower()):
+                if separator and value and (key.lower().startswith(("gld:", "koa:")) or "sess" in key.lower() or "token" in key.lower()):
                     register_secret(value)
         logger.info("已从 %s 加载 %s 个账号。", source, len(self.accounts))
 
 
 class APIError(Exception):
     """A safe diagnostic that never contains request headers or response bodies."""
+
+
+@dataclass(frozen=True)
+class UserStatus:
+    email: str
+    days: str
 
 
 def display_text(value, fallback="未知") -> str:
@@ -158,8 +158,8 @@ class API:
     def __exit__(self, exc_type, exc_value, traceback):
         self.session.close()
 
-    def _request(self, path: str, method="GET", data=None, retry=True) -> dict:
-        attempts = 3 if retry else 1
+    def _request(self, path: str, method="GET", data=None) -> dict:
+        attempts = 3
         for attempt in range(attempts):
             try:
                 response = self.session.request(
@@ -190,13 +190,17 @@ class API:
         # Check-in is idempotent: a retried successful request returns code 1.
         return self._request("/api/user/checkin", "POST", {"token": self.domain})
 
-    def get_status(self) -> str:
+    def get_status(self) -> UserStatus:
         payload = self._request("/api/user/status")
         data = payload.get("data")
-        days = number(data.get("leftDays")) if isinstance(data, dict) else None
-        if payload.get("code") != 0 or days is None:
-            raise APIError("无法查询剩余天数。")
-        return f"{days} 天"
+        if payload.get("code") != 0 or not isinstance(data, dict):
+            message = display_text(payload.get("message"), "无法读取账号状态")
+            raise APIError(f"{message}（Cookie 未通过认证，请重新登录后更新 Secret）")
+        email = data.get("email")
+        if not isinstance(email, str) or "@" not in email:
+            raise APIError("接口未返回有效邮箱，无法核对 Cookie 对应的账号。")
+        days = number(data.get("leftDays"))
+        return UserStatus(email.strip(), f"{days} 天" if days is not None else "未知")
 
     def get_points(self) -> tuple[str, Optional[int]]:
         payload = self._request("/api/user/points")
@@ -205,24 +209,22 @@ class API:
             raise APIError("无法查询总积分。")
         return str(points), points
 
-    def exchange(self, plan: str) -> str:
-        # Never retry an exchange: a timeout may happen after points are spent.
-        payload = self._request("/api/user/exchange", "POST", {"planType": plan}, retry=False)
-        if payload.get("code") == 0:
-            return f"兑换成功：{plan}"
-        return f"兑换失败：{display_text(payload.get('message'))}"
-
-
 @dataclass
 class CheckinResult:
     account: str
     domain: str
+    email: str = ""
     code: CheckinStatus = CheckinStatus.FAILURE
     points: str = "0"
     days: str = "未知"
     points_total: str = "未知"
     message: str = ""
-    exchange: str = "未启用"
+
+    @property
+    def identifier(self) -> str:
+        if self.email and self.email != self.account:
+            return f"{self.account} ({self.email})"
+        return self.account
 
     @property
     def ok(self) -> bool:
@@ -253,7 +255,7 @@ class Checker:
                 except Exception as error:
                     # One account must not prevent the others from being checked in.
                     message = str(error) if isinstance(error, APIError) else f"账号处理异常（{type(error).__name__}）"
-                    result = CheckinResult(account.name, domain, message=message)
+                    result = CheckinResult(account.name, domain, email=account.email, message=message)
                 if result.ok:
                     break
                 failures.append(f"{domain}：{result.message}")
@@ -263,12 +265,19 @@ class Checker:
                 result.domain = " / ".join(account.domains)
                 result.message = "；".join(failures)
             self.results.append(result)
-            logger.info("[%s][%s] %s，剩余 %s，总积分 %s。", account.name, result.domain, result.status, result.days, result.points_total)
+            logger.info("[%s][%s] %s，剩余 %s，总积分 %s。", result.identifier, result.domain, result.status, result.days, result.points_total)
         return self.results
 
     def _checkin_on_domain(self, account: Account, domain: str) -> CheckinResult:
-        result = CheckinResult(account.name, domain)
+        result = CheckinResult(account.name, domain, email=account.email)
         with API(account, domain, self.config.verbose) as api:
+            # Verify the identity before submitting a check-in for this Cookie.
+            status = api.get_status()
+            if account.email and status.email.casefold() != account.email.casefold():
+                result.message = "Cookie 对应的邮箱与配置邮箱不一致，请更新该账号的 Cookie 或 email。"
+                return result
+            result.email = status.email
+            result.days = status.days
             payload = api.checkin()
             code = payload.get("code")
             result.message = display_text(payload.get("message"), "接口未返回消息")
@@ -280,34 +289,22 @@ class Checker:
             result.code = CheckinStatus(code)
             result.points = display_text(payload.get("points", 0), "0") if code == 0 else "0"
             if self.config.verbose:
-                logger.info("[%s][%s] 接口消息：%s", account.name, domain, result.message)
+                logger.info("[%s][%s] 接口消息：%s", result.identifier, domain, result.message)
 
+            if result.code == CheckinStatus.SUCCESS:
+                try:
+                    updated_status = api.get_status()
+                    if updated_status.email.casefold() != result.email.casefold():
+                        result.code = CheckinStatus.FAILURE
+                        result.message = "签到后的邮箱与签到前不一致，请检查账号配置。"
+                        return result
+                    result.days = updated_status.days
+                except APIError as error:
+                    logger.warning("[%s][%s] 签到后状态查询失败：%s", result.identifier, domain, error)
             try:
-                result.days = api.get_status()
+                result.points_total, _ = api.get_points()
             except APIError as error:
-                logger.warning("[%s][%s] %s", account.name, domain, error)
-            points = None
-            try:
-                result.points_total, points = api.get_points()
-            except APIError as error:
-                logger.warning("[%s][%s] %s", account.name, domain, error)
-
-            if account.exchange_plan in EXCHANGE_PLANS:
-                required = EXCHANGE_PLANS[account.exchange_plan]
-                if result.code == CheckinStatus.REPEAT:
-                    result.exchange = "今日已签到，跳过兑换"
-                elif points is None or points < required:
-                    result.exchange = f"积分不足或无法查询，跳过兑换（需要 {required}）"
-                else:
-                    try:
-                        result.exchange = api.exchange(account.exchange_plan)
-                        # Show the current balance after a successful exchange.
-                        if result.exchange.startswith("兑换成功"):
-                            result.days = api.get_status()
-                            result.points_total, _ = api.get_points()
-                    except APIError as error:
-                        result.exchange = f"兑换或兑换后查询失败：{error}"
-                    logger.info("[%s][%s] %s", account.name, domain, result.exchange)
+                logger.warning("[%s][%s] %s", result.identifier, domain, error)
         return result
 
     @property
@@ -320,7 +317,7 @@ class Checker:
         failures = sum(not result.ok for result in self.results)
         title = f"GLaDOS 签到：成功 {successes}，已签到 {repeats}，失败 {failures}"
         content = "\n".join(
-            f"{result.account} [{result.domain}] {result.status} | 剩余 {result.days} | 总积分 {result.points_total} | {result.exchange}"
+            f"{result.identifier} [{result.domain}] {result.status} | 剩余 {result.days} | 总积分 {result.points_total}"
             + (f" | {result.message}" if not result.ok else "")
             for result in self.results
         )
@@ -339,11 +336,11 @@ def write_summary(title: str, results: list[CheckinResult], error="") -> None:
     lines = [f"## {markdown_cell(title)}", ""]
     if results:
         lines.extend([
-            "| 账号 | 域名 | 结果 | 本次积分 | 剩余天数 | 总积分 | 兑换 | 说明 |",
+            "| 账号 | 邮箱 | 域名 | 结果 | 本次积分 | 剩余天数 | 总积分 | 说明 |",
             "| --- | --- | --- | --- | --- | --- | --- | --- |",
         ])
         for result in results:
-            values = (result.account, result.domain, result.status, result.points, result.days, result.points_total, result.exchange, result.message)
+            values = (result.account, result.email or "未验证", result.domain, result.status, result.points, result.days, result.points_total, result.message)
             lines.append("| " + " | ".join(markdown_cell(value) for value in values) + " |")
     if error:
         lines.append(markdown_cell(error))

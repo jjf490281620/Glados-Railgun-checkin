@@ -10,7 +10,7 @@ import requests
 
 import checkin
 import logging_config
-from checkin import API, APIError, Account, Checker, CheckinResult, CheckinStatus, Config, parse_accounts
+from checkin import API, APIError, Account, Checker, CheckinResult, CheckinStatus, Config, UserStatus, parse_accounts
 
 
 def cookie(label):
@@ -37,18 +37,18 @@ class ConfigTests(CheckinTestCase):
     def test_multiline_and_legacy_formats(self):
         for separator in ("\n", "\r\n", "&"):
             with self.subTest(separator=separator):
-                accounts = parse_accounts(f" Cookie: {cookie('one')}{separator}{cookie('two')} ", "GLADOS_COOKIES", "none")
+                accounts = parse_accounts(f" Cookie: {cookie('one')}{separator}{cookie('two')} ", "GLADOS_COOKIES")
                 self.assertEqual([account.cookie for account in accounts], [cookie("one"), cookie("two")])
                 self.assertEqual([account.name for account in accounts], ["账号 1", "账号 2"])
 
     def test_json_preserves_ampersands_and_account_options(self):
         accounts = parse_accounts(json.dumps([
-            {"name": "主账号", "domain": "https://railgun.info/", "cookie": cookie("a&b"), "exchange_plan": "plan100"},
+            {"name": "主账号", "email": "one@example.com", "domain": "https://railgun.info/", "cookie": cookie("a&b")},
             cookie("two"),
-        ]), "GLADOS_ACCOUNTS", "none")
+        ]), "GLADOS_ACCOUNTS")
         self.assertEqual(accounts[0].domains, ("railgun.info",))
         self.assertEqual(accounts[0].cookie, cookie("a&b"))
-        self.assertEqual(accounts[0].exchange_plan, "plan100")
+        self.assertEqual(accounts[0].email, "one@example.com")
         self.assertEqual(accounts[1].domains, checkin.DOMAINS)
 
     def test_preferred_secret_overrides_legacy(self):
@@ -61,14 +61,14 @@ class ConfigTests(CheckinTestCase):
         self.assertEqual(len(config.accounts), 2)
 
     def test_duplicate_cookie_and_domain_are_not_run_twice(self):
-        accounts = parse_accounts(f"{cookie('same')}\n{cookie('same')}", "GLADOS_COOKIES", "none")
+        accounts = parse_accounts(f"{cookie('same')}\n{cookie('same')}", "GLADOS_COOKIES")
         self.assertEqual(len(accounts), 1)
 
     def test_invalid_configs_reject_without_echoing_credentials(self):
         invalid = (
             "[]", "{}", "[", json.dumps([{}]),
             json.dumps([{"cookie": cookie("private"), "domain": "attacker.example"}]),
-            json.dumps([{"cookie": cookie("private"), "exchange_plan": "plan999"}]),
+            json.dumps([{"cookie": cookie("private"), "email": "invalid address"}]),
             json.dumps([{"cookie": cookie("private"), "name": "bad\nname"}]),
             json.dumps([{"cookie": cookie("private") + "\r\nInjected: header"}]),
             json.dumps([{"cookie": cookie("private"), "cookies": "typo"}]),
@@ -76,12 +76,13 @@ class ConfigTests(CheckinTestCase):
         for raw in invalid:
             with self.subTest(raw=raw):
                 with self.assertRaises(ValueError) as raised:
-                    parse_accounts(raw, "GLADOS_ACCOUNTS", "none")
+                    parse_accounts(raw, "GLADOS_ACCOUNTS")
                 self.assertNotIn(cookie("private"), str(raised.exception))
 
-    def test_global_exchange_default_and_per_account_override(self):
-        config = self.config(accounts=[{"cookie": cookie("one")}, {"cookie": cookie("two"), "exchange_plan": "none"}], GLADOS_EXCHANGE_PLAN="plan200")
-        self.assertEqual([account.exchange_plan for account in config.accounts], ["plan200", "none"])
+    def test_email_is_the_default_account_name(self):
+        config = self.config(accounts=[{"cookie": cookie("one"), "email": "one@example.com"}])
+        self.assertEqual(config.accounts[0].name, "one@example.com")
+        self.assertEqual(config.accounts[0].email, "one@example.com")
         self.assertNotIn(cookie("one"), repr(config.accounts[0]))
 
     def test_missing_config_exits_nonzero_and_writes_summary(self):
@@ -143,53 +144,62 @@ class AccountExecutionTests(CheckinTestCase):
         with patch("checkin.API") as client:
             api = client.return_value.__enter__.return_value
             api.checkin.return_value = {"code": 0, "points": 3, "message": "ok"}
-            api.get_status.return_value = "25 天"
+            api.get_status.return_value = UserStatus("one@example.com", "25 天")
             api.get_points.return_value = ("99", 99)
             result = checker._checkin_on_domain(checker.config.accounts[0], "glados.cloud")
         self.assertEqual((result.points, result.days, result.points_total), ("3", "25 天", "99"))
+        self.assertEqual(result.email, "one@example.com")
 
-    def test_failed_checkin_skips_balance_and_exchange(self):
-        checker = Checker(self.config(cookies=cookie("one"), GLADOS_EXCHANGE_PLAN="plan100"))
+    def test_failed_checkin_skips_balance(self):
+        checker = Checker(self.config(cookies=cookie("one")))
         with patch("checkin.API") as client:
             api = client.return_value.__enter__.return_value
+            api.get_status.return_value = UserStatus("one@example.com", "25 天")
             api.checkin.return_value = {"code": -2, "message": "No permission"}
             result = checker._checkin_on_domain(checker.config.accounts[0], "glados.cloud")
-            api.get_status.assert_not_called()
+            api.get_status.assert_called_once()
             api.get_points.assert_not_called()
-            api.exchange.assert_not_called()
         self.assertFalse(result.ok)
         self.assertIn("更新 Secret", result.message)
 
-    def test_exchange_requires_new_checkin_and_enough_points(self):
-        checker = Checker(self.config(cookies=cookie("one"), GLADOS_EXCHANGE_PLAN="plan100"))
-        for code, points in ((0, 99), (1, 200)):
-            with self.subTest(code=code, points=points):
-                with patch("checkin.API") as client:
-                    api = client.return_value.__enter__.return_value
-                    api.checkin.return_value = {"code": code, "message": "ok"}
-                    api.get_status.return_value = "25 天"
-                    api.get_points.return_value = (str(points), points)
-                    checker._checkin_on_domain(checker.config.accounts[0], "glados.cloud")
-                    api.exchange.assert_not_called()
-
-    def test_confirmed_exchange_refreshes_balance(self):
-        checker = Checker(self.config(cookies=cookie("one"), GLADOS_EXCHANGE_PLAN="plan100"))
+    def test_email_mismatch_prevents_checkin(self):
+        checker = Checker(self.config(accounts=[{"cookie": cookie("one"), "email": "expected@example.com", "domain": "glados.cloud"}]))
         with patch("checkin.API") as client:
             api = client.return_value.__enter__.return_value
-            api.checkin.return_value = {"code": 0, "message": "ok"}
-            api.get_status.side_effect = ["25 天", "35 天"]
-            api.get_points.side_effect = [("150", 150), ("50", 50)]
-            api.exchange.return_value = "兑换成功：plan100"
+            api.get_status.return_value = UserStatus("different@example.com", "25 天")
             result = checker._checkin_on_domain(checker.config.accounts[0], "glados.cloud")
-            api.exchange.assert_called_once_with("plan100")
-        self.assertEqual((result.days, result.points_total), ("35 天", "50"))
+            api.checkin.assert_not_called()
+        self.assertFalse(result.ok)
+        self.assertEqual(result.email, "expected@example.com")
+        self.assertIn("邮箱不一致", result.message)
+
+    def test_matching_email_is_verified_before_checkin(self):
+        checker = Checker(self.config(accounts=[{"name": "主账号", "cookie": cookie("one"), "email": "ONE@example.com"}]))
+        with patch("checkin.API") as client:
+            api = client.return_value.__enter__.return_value
+            api.get_status.return_value = UserStatus("one@example.com", "25 天")
+            api.checkin.return_value = {"code": 1, "message": "already checked in"}
+            api.get_points.return_value = ("99", 99)
+            result = checker._checkin_on_domain(checker.config.accounts[0], "glados.cloud")
+            api.checkin.assert_called_once()
+        self.assertTrue(result.ok)
+        self.assertEqual(result.identifier, "主账号 (one@example.com)")
+
+    def test_expired_cookie_never_reaches_checkin(self):
+        checker = Checker(self.config(cookies=cookie("one")))
+        with patch("checkin.API") as client:
+            api = client.return_value.__enter__.return_value
+            api.get_status.side_effect = APIError("Cookie 未通过认证")
+            checker.checkin_all()
+            api.checkin.assert_not_called()
+        self.assertTrue(checker.has_failures)
 
     def test_optional_balance_error_does_not_undo_confirmed_checkin(self):
         checker = Checker(self.config(cookies=cookie("one")))
         with patch("checkin.API") as client:
             api = client.return_value.__enter__.return_value
             api.checkin.return_value = {"code": 0, "message": "ok"}
-            api.get_status.side_effect = APIError("无法查询剩余天数")
+            api.get_status.side_effect = [UserStatus("one@example.com", "25 天"), APIError("无法查询剩余天数")]
             api.get_points.side_effect = APIError("无法查询总积分")
             result = checker._checkin_on_domain(checker.config.accounts[0], "glados.cloud")
         self.assertTrue(result.ok)
@@ -224,12 +234,16 @@ class TransportTests(CheckinTestCase):
                 self.assertEqual(request.call_count, 3)
                 self.assertNotIn(cookie("one"), str(raised.exception))
 
-    def test_exchange_is_never_retried_after_timeout(self):
+    def test_status_requires_email_to_identify_the_account(self):
         with API(Account("one", cookie("one")), "glados.cloud") as api:
-            with patch.object(api.session, "request", side_effect=requests.Timeout()) as request:
+            with patch.object(api.session, "request", return_value=self.response(payload={"code": 0, "data": {"leftDays": "25"}})):
                 with self.assertRaises(APIError):
-                    api.exchange("plan100")
-                request.assert_called_once()
+                    api.get_status()
+
+    def test_status_returns_email_and_remaining_days(self):
+        with API(Account("one", cookie("one")), "glados.cloud") as api:
+            with patch.object(api.session, "request", return_value=self.response(payload={"code": 0, "data": {"email": "one@example.com", "leftDays": "25.8"}})):
+                self.assertEqual(api.get_status(), UserStatus("one@example.com", "25 天"))
 
     def test_non_json_or_unrecognized_response_fails_safely(self):
         for response in (Mock(status_code=200, json=Mock(side_effect=ValueError("private response"))), self.response(payload=[]), self.response(payload={"message": "private response"}), self.response(302)):
@@ -242,6 +256,13 @@ class TransportTests(CheckinTestCase):
 
 
 class OutputTests(CheckinTestCase):
+    def test_new_gld_cookie_and_account_signatures_are_masked(self):
+        value = "gld:accts=example-account-token; gld:accts.sig=example-account-signature; gld:sess=example-account-token; gld:sess.sig=example-session-signature"
+        config = self.config(cookies=value)
+        self.assertEqual(config.accounts[0].cookie, value)
+        for secret in (value, "example-account-token", "example-account-signature", "example-session-signature"):
+            self.assertEqual(logging_config.redact_text(secret), "***")
+
     def test_summary_and_logs_redact_cookie_and_individual_session(self):
         config = self.config(cookies=cookie("private"))
         session_value = "private-session-value"

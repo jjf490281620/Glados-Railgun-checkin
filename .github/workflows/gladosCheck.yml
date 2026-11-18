@@ -72,7 +72,6 @@ jobs:
           PYTHONUNBUFFERED: '1'
           GLADOS_ACCOUNTS: ${{ secrets.GLADOS_ACCOUNTS }}
           GLADOS_COOKIES: ${{ secrets.GLADOS_COOKIES }}
-          GLADOS_EXCHANGE_PLAN: ${{ secrets.GLADOS_EXCHANGE_PLAN }}
           GLADOS_VERBOSE: ${{ secrets.GLADOS_VERBOSE }}
           PUSHDEER_SENDKEY: ${{ secrets.PUSHDEER_SENDKEY }}
       - name: Keep scheduled workflow active
