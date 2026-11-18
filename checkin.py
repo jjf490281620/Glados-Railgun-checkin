@@ -19,6 +19,14 @@ from logging_config import init_logger, redact_text, register_secret
 
 logger = init_logger()
 DOMAINS = ("glados.cloud", "railgun.info")
+PLATFORM_USER_AGENTS = {
+    "windows": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "macos": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36",
+    "linux": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "iphone": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1",
+    "ios": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1",
+    "android": "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36",
+}
 
 
 class CheckinStatus(Enum):
@@ -34,6 +42,7 @@ class Account:
     cookie: str = field(repr=False)
     domains: tuple[str, ...] = DOMAINS
     email: str = ""
+    user_agent: str = ""
 
 
 def parse_accounts(raw: str, source: str) -> list[Account]:
@@ -58,8 +67,8 @@ def parse_accounts(raw: str, source: str) -> list[Account]:
             entry = {"cookie": entry}
         if not isinstance(entry, dict):
             raise ValueError(f"账号 {index} 必须是 Cookie 字符串或账号对象。")
-        if set(entry) - {"name", "email", "cookie", "domain"}:
-            raise ValueError(f"账号 {index} 仅支持 name、email、cookie、domain 字段。")
+        if set(entry) - {"name", "email", "cookie", "domain", "user-agent"}:
+            raise ValueError(f"账号 {index} 仅支持 name、email、cookie、domain、user-agent 字段。")
 
         cookie = entry.get("cookie")
         if not isinstance(cookie, str) or not cookie.strip():
@@ -84,12 +93,16 @@ def parse_accounts(raw: str, source: str) -> list[Account]:
             raise ValueError(f"账号 {index} 的 domain 必须是 auto、glados.cloud 或 railgun.info。")
         domains = DOMAINS if domain == "auto" else (domain,)
 
+        user_agent = entry.get("user-agent", "")
+        if not isinstance(user_agent, str) or len(user_agent) > 1024 or any(not 32 <= ord(char) < 127 for char in user_agent):
+            raise ValueError(f"账号 {index} 的 user-agent 必须是不超过 1024 字符的单行 ASCII 文本。")
+
         key = (cookie, domains)
         if key in seen:
             logger.warning("账号 %s 与前面的 Cookie 和域名相同，跳过重复配置。", index)
             continue
         seen.add(key)
-        accounts.append(Account(name.strip(), cookie, domains, email))
+        accounts.append(Account(name.strip(), cookie, domains, email, user_agent.strip()))
     return accounts
 
 
@@ -146,6 +159,14 @@ def number(value) -> Optional[int]:
         return None
 
 
+def response_code(value) -> Optional[int]:
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    if isinstance(value, str) and re.fullmatch(r"-?\d+", value.strip()):
+        return int(value.strip())
+    return None
+
+
 class API:
     def __init__(self, account: Account, domain: str, verbose: bool = False):
         self.account = account
@@ -156,7 +177,7 @@ class API:
             "Cookie": account.cookie,
             "Origin": f"https://{domain}",
             "Referer": f"https://{domain}/console/checkin",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            "User-Agent": account.user_agent or PLATFORM_USER_AGENTS["windows"],
         })
 
     def __enter__(self):
@@ -200,13 +221,8 @@ class API:
             if error.http_status == 404:
                 return None
             raise
-        if challenge.get("code") != 0:
+        if response_code(challenge.get("code")) != 0:
             raise APIError(display_text(challenge.get("message"), "无法获取签到校验请求。"))
-        if challenge.get("turnstile"):
-            raise APIError(
-                "网站要求完成 Cloudflare Turnstile 网页验证；当前 GitHub 接口任务无法完成本次签到。请在官网登录并检查签到页。",
-                browser_required=True,
-            )
         nonce = challenge.get("nonce")
         if not isinstance(nonce, str) or not nonce:
             raise APIError("签到接口未返回有效的校验请求。")
@@ -216,26 +232,42 @@ class API:
         register_secret(nonce)
         return nonce
 
-    def checkin(self) -> dict:
+    def _checkin_attempt(self) -> dict:
         nonce = self._get_checkin_nonce()
         payload = {"token": self.domain}
         if nonce:
-            # Follow the web client's protocol when browser verification is
-            # not required. Never synthesize a Turnstile token.
+            # Match upstream's API protocol. A public Turnstile site key does
+            # not by itself decide whether this submission will be accepted.
+            # Do not invent a verification token or claim verification is off.
             time.sleep(2.5)
             payload.update({
                 "nonce": nonce,
                 "proof": hashlib.sha256((nonce + ".glados-observe-v1").encode("utf-8")).hexdigest(),
-                "tsState": "off",
             })
         # A nonce is single-use; a later run obtains a fresh one if the response
         # is lost. Older endpoints without challenges retain bounded retries.
         return self._request("/api/user/checkin", "POST", payload, retry=nonce is None)
 
+    def checkin(self) -> dict:
+        payload = self._checkin_attempt()
+        if response_code(payload.get("code")) != 4 or payload.get("reason") != "device-mismatch":
+            return payload
+        if self.account.user_agent:
+            return payload
+        login_device = payload.get("loginDevice")
+        recovered_agent = PLATFORM_USER_AGENTS.get(login_device.casefold()) if isinstance(login_device, str) else None
+        if not recovered_agent or recovered_agent == self.session.headers["User-Agent"]:
+            return payload
+        logger.info("[%s][%s] 按服务端返回的登录设备 %s 调整 User-Agent，重新获取校验请求后重试一次。", self.account.name, self.domain, display_text(login_device))
+        self.session.headers["User-Agent"] = recovered_agent
+        # Each attempt obtains a new nonce; a rejected or used nonce is never
+        # replayed. The retry stays within the verified account and domain.
+        return self._checkin_attempt()
+
     def get_status(self) -> UserStatus:
         payload = self._request("/api/user/status")
         data = payload.get("data")
-        if payload.get("code") != 0 or not isinstance(data, dict):
+        if response_code(payload.get("code")) != 0 or not isinstance(data, dict):
             message = display_text(payload.get("message"), "无法读取账号状态")
             raise APIError(f"{message}（Cookie 未通过认证，请重新登录后更新 Secret）")
         email = data.get("email")
@@ -247,7 +279,7 @@ class API:
     def get_points(self) -> tuple[str, Optional[int]]:
         payload = self._request("/api/user/points")
         points = number(payload.get("points"))
-        if payload.get("code") != 0 or points is None:
+        if response_code(payload.get("code")) != 0 or points is None:
             raise APIError("无法查询总积分。")
         return str(points), points
 
@@ -336,18 +368,27 @@ class Checker:
                 if error.browser_required:
                     result.code = CheckinStatus.REQUIRES_BROWSER
                 return result
-            code = payload.get("code")
+            code = response_code(payload.get("code"))
             result.message = display_text(payload.get("message"), "接口未返回消息")
-            if isinstance(code, bool) or code not in (0, 1):
-                if payload.get("reason") in ("turnstile", "device-mismatch"):
-                    result.code = CheckinStatus.REQUIRES_BROWSER
-                    result.message += "（网站要求在登录对应账号的浏览器中完成验证）"
+            reason = payload.get("reason")
+            if reason == "device-mismatch":
+                result.code = CheckinStatus.REQUIRES_BROWSER
+                result.message += "（登录设备仍不匹配；请为该账号填写提取 Cookie 时浏览器的 user-agent）"
+                return result
+            if reason == "turnstile" or any(word in result.message.lower() for word in ("cloudflare", "turnstile")):
+                result.code = CheckinStatus.REQUIRES_BROWSER
+                result.message += "（网站要求在登录对应账号的浏览器中完成网页验证）"
+                return result
+            if "please checkin via" in result.message.lower():
+                result.message += "（服务端要求使用其他签到域名，请核对该账号的 domain）"
+                return result
+            if code not in (0, 1):
                 if code == -2 or "permission" in result.message.lower() or "权限" in result.message:
                     result.message += "（Cookie 未通过认证，请重新登录后更新 Secret）"
                 return result
 
             result.code = CheckinStatus.REPEAT if code == 1 or payload.get("repeated") is True else CheckinStatus.SUCCESS
-            result.points = display_text(payload.get("points", 0), "0") if result.code == CheckinStatus.SUCCESS else "0"
+            result.points = str(number(payload.get("points", payload.get("earned", 0))) or 0) if result.code == CheckinStatus.SUCCESS else "0"
             if self.config.verbose:
                 logger.info("[%s][%s] 接口消息：%s", result.identifier, domain, result.message)
 

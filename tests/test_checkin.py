@@ -71,6 +71,7 @@ class ConfigTests(CheckinTestCase):
             json.dumps([{"cookie": cookie("private"), "email": "invalid address"}]),
             json.dumps([{"cookie": cookie("private"), "name": "bad\nname"}]),
             json.dumps([{"cookie": cookie("private") + "\r\nInjected: header"}]),
+            json.dumps([{"cookie": cookie("private"), "user-agent": "browser\r\nInjected: header"}]),
             json.dumps([{"cookie": cookie("private"), "cookies": "typo"}]),
         )
         for raw in invalid:
@@ -84,6 +85,15 @@ class ConfigTests(CheckinTestCase):
         self.assertEqual(config.accounts[0].name, "one@example.com")
         self.assertEqual(config.accounts[0].email, "one@example.com")
         self.assertNotIn(cookie("one"), repr(config.accounts[0]))
+
+    def test_custom_user_agent_is_bound_to_its_account(self):
+        config = self.config(accounts=[
+            {"cookie": cookie("one"), "user-agent": "My browser/1.0"},
+            {"cookie": cookie("two")},
+        ])
+        with API(config.accounts[0], "glados.cloud") as first, API(config.accounts[1], "glados.cloud") as second:
+            self.assertEqual(first.session.headers["User-Agent"], "My browser/1.0")
+            self.assertEqual(second.session.headers["User-Agent"], checkin.PLATFORM_USER_AGENTS["windows"])
 
     def test_missing_config_exits_nonzero_and_writes_summary(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -232,6 +242,37 @@ class AccountExecutionTests(CheckinTestCase):
         self.assertEqual(result.code, CheckinStatus.REPEAT)
         self.assertEqual(result.points, "0")
 
+    def test_rejected_responses_never_become_success_even_with_code_zero(self):
+        checker = Checker(self.config(cookies=cookie("one")))
+        cases = (
+            ({"code": 0, "message": "please checkin via https://railgun.info"}, CheckinStatus.FAILURE),
+            ({"code": 0, "message": "Cloudflare verification failed"}, CheckinStatus.REQUIRES_BROWSER),
+            ({"code": 5, "reason": "turnstile", "repeated": True}, CheckinStatus.REQUIRES_BROWSER),
+            ({"code": 4, "reason": "device-mismatch"}, CheckinStatus.REQUIRES_BROWSER),
+            ({"code": True, "message": "invalid response"}, CheckinStatus.FAILURE),
+        )
+        for payload, expected in cases:
+            with self.subTest(payload=payload), patch("checkin.API") as client:
+                api = client.return_value.__enter__.return_value
+                api.get_status.return_value = UserStatus("one@example.com", "25 天")
+                api.get_points.return_value = ("99", 99)
+                api.checkin.return_value = payload
+                result = checker._checkin_on_domain(checker.config.accounts[0], "glados.cloud")
+            self.assertEqual(result.code, expected)
+            self.assertFalse(result.ok)
+            self.assertEqual((result.email, result.points_total), ("one@example.com", "99"))
+
+    def test_string_response_code_and_earned_points_are_supported(self):
+        checker = Checker(self.config(cookies=cookie("one")))
+        with patch("checkin.API") as client:
+            api = client.return_value.__enter__.return_value
+            api.get_status.return_value = UserStatus("one@example.com", "25 天")
+            api.get_points.return_value = ("99", 99)
+            api.checkin.return_value = {"code": "0", "earned": "3.00000000", "message": "ok"}
+            result = checker._checkin_on_domain(checker.config.accounts[0], "glados.cloud")
+        self.assertEqual(result.code, CheckinStatus.SUCCESS)
+        self.assertEqual(result.points, "3")
+
     def test_browser_verification_does_not_report_a_successful_workflow(self):
         self.config(cookies=cookie("one"))
         result = CheckinResult("账号 1", "glados.cloud", code=CheckinStatus.REQUIRES_BROWSER, identity_verified=True)
@@ -276,18 +317,61 @@ class TransportTests(CheckinTestCase):
                 payload = request.call_args.kwargs["json"]
                 self.assertEqual(payload["nonce"], "sample-nonce")
                 self.assertEqual(payload["proof"], "67851acd026743579f8c37b98a962b0b0a1b9cbb4688f1167f0219b2de1e9745")
-                self.assertEqual(payload["tsState"], "off")
+                self.assertNotIn("tsState", payload)
+                self.assertNotIn("turnstile", payload)
                 wait.assert_called_once_with(2.5)
 
-    def test_required_turnstile_stops_before_submitting_checkin(self):
+    def test_turnstile_site_key_does_not_preempt_the_server_response(self):
         challenge = self.response(payload={"code": 0, "nonce": "sample-nonce", "turnstile": "public-site-key"})
+        rejection = {"code": 5, "reason": "turnstile", "message": "Cloudflare verification failed"}
         with API(Account("one", cookie("one")), "glados.cloud") as api:
-            with patch.object(api.session, "request", return_value=challenge) as request:
-                with self.assertRaises(APIError) as raised:
-                    api.checkin()
+            with patch.object(api.session, "request", side_effect=[challenge, self.response(payload=rejection)]) as request, patch("checkin.time.sleep"):
+                self.assertEqual(api.checkin(), rejection)
+                self.assertEqual(request.call_count, 2)
+                self.assertEqual(request.call_args.args[0], "POST")
+                self.assertNotIn("turnstile", request.call_args.kwargs["json"])
+                self.assertNotIn("tsState", request.call_args.kwargs["json"])
+
+    def test_device_mismatch_retries_once_with_matching_platform_and_fresh_nonce(self):
+        responses = iter([
+            self.response(payload={"code": 0, "nonce": "first-nonce"}),
+            self.response(payload={"code": 4, "reason": "device-mismatch", "loginDevice": "macOS"}),
+            self.response(payload={"code": 0, "nonce": "second-nonce"}),
+            self.response(payload={"code": 0, "points": 3}),
+        ])
+        agents = []
+        with API(Account("one", cookie("one")), "glados.cloud") as api:
+            def respond(*args, **kwargs):
+                agents.append(api.session.headers["User-Agent"])
+                return next(responses)
+
+            with patch.object(api.session, "request", side_effect=respond) as request, patch("checkin.time.sleep"):
+                self.assertEqual(api.checkin()["code"], 0)
+            posts = [call for call in request.call_args_list if call.args[0] == "POST"]
+        self.assertEqual(agents, [checkin.PLATFORM_USER_AGENTS["windows"]] * 2 + [checkin.PLATFORM_USER_AGENTS["macos"]] * 2)
+        self.assertEqual([call.kwargs["json"]["nonce"] for call in posts], ["first-nonce", "second-nonce"])
+
+    def test_explicit_user_agent_is_not_replaced_after_device_mismatch(self):
+        rejection = {"code": 4, "reason": "device-mismatch", "loginDevice": "macOS"}
+        with API(Account("one", cookie("one"), user_agent="My browser/1.0"), "glados.cloud") as api:
+            with patch.object(api, "_get_checkin_nonce", return_value=None), patch.object(api.session, "request", return_value=self.response(payload=rejection)) as request:
+                self.assertEqual(api.checkin(), rejection)
                 request.assert_called_once()
-                self.assertEqual(request.call_args.args[0], "GET")
-        self.assertTrue(raised.exception.browser_required)
+                self.assertEqual(api.session.headers["User-Agent"], "My browser/1.0")
+
+    def test_unrecognized_login_device_is_not_guessed(self):
+        rejection = {"code": 4, "reason": "device-mismatch", "loginDevice": "unknown-device"}
+        with API(Account("one", cookie("one")), "glados.cloud") as api:
+            with patch.object(api, "_get_checkin_nonce", return_value=None), patch.object(api.session, "request", return_value=self.response(payload=rejection)) as request:
+                self.assertEqual(api.checkin(), rejection)
+                request.assert_called_once()
+
+    def test_platform_recovery_does_not_repeat_indefinitely(self):
+        rejection = {"code": 4, "reason": "device-mismatch", "loginDevice": "macOS"}
+        with API(Account("one", cookie("one")), "glados.cloud") as api:
+            with patch.object(api, "_get_checkin_nonce", return_value=None), patch.object(api.session, "request", return_value=self.response(payload=rejection)) as request:
+                self.assertEqual(api.checkin(), rejection)
+                self.assertEqual(request.call_count, 2)
 
     def test_older_domain_without_challenge_endpoint_still_checks_in(self):
         with API(Account("one", cookie("one")), "railgun.info") as api:

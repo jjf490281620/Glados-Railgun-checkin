@@ -6,11 +6,11 @@
 
 ## 网站验证限制
 
-新版 GLaDOS 签到接口会先下发一次性校验请求，并可能要求 **Cloudflare Turnstile 网页验证**。Cookie 能读取账号信息，不代表网站允许当前请求直接签到。
+新版 GLaDOS 签到接口会先下发一次性校验请求，并可能要求 **Cloudflare Turnstile 网页验证**。本仓库已对齐上游 v1.0.1 的接口提交方式：获取 nonce、等待 2.5 秒，再提交 JSON 格式的 nonce 和 proof，由服务端实际响应判定签到结果。校验接口返回公共 Turnstile site key 时仍会尝试正常接口请求，不伪造网页验证令牌或验证状态。
 
-脚本支持无需网页验证的新版请求，以及没有校验接口的旧版请求。网站要求 Turnstile 或登录设备验证时，该账号显示“需要网页验证”，保留已核对的邮箱、剩余天数和积分，工作流返回失败状态并继续处理其他账号。GitHub 的纯接口任务无法完成网页验证码。
+服务端返回设备不匹配时，未配置 `user-agent` 的账号会按服务端返回的登录平台自动调整一次，并重新获取 nonce 后重试。这样可以处理 Cookie 来自 macOS、脚本默认使用 Windows 标识的情况。账号仍不匹配时，填写复制 Cookie 时浏览器的完整 User-Agent。
 
-是否要求网页验证由网站决定；重新登录或更新 Cookie 后仍可能需要验证。因此，在受此限制的账号上，不能保证仅靠 GitHub Actions 和 Cookie 实现无人值守签到。
+服务端明确拒绝签到并要求 Turnstile 时，该账号显示“需要网页验证”，保留已核对的邮箱、剩余天数和积分，工作流返回失败状态并继续处理其他账号。纯接口任务无法完成网页验证码；上游 v1.0.1 另提供[浏览器扩展](https://github.com/Devilstore/Glados-Railgun-checkin/tree/master/extension)，需要浏览器运行，在官网页面由官方组件完成验证。是否允许接口签到以及实际获得多少积分，由网站决定。
 
 ## 部署
 
@@ -49,6 +49,7 @@
 | `email` | 建议填写，用于绑定账号；签到前必须与接口返回的邮箱一致 |
 | `name` | 可选别名；默认使用配置邮箱，没有配置邮箱时按顺序编号 |
 | `domain` | `glados.cloud`、`railgun.info` 或 `auto`；默认 `auto` |
+| `user-agent` | 可选，复制 Cookie 时浏览器的完整 User-Agent；未填写时支持一次登录平台自动恢复 |
 
 未配置 `email` 时，脚本仍会读取并显示该 Cookie 对应的真实邮箱。如果接口未返回有效邮箱，则停止处理该账号并报错。
 
@@ -87,6 +88,7 @@ gld:accts=ACCOUNT_2_TOKEN; gld:accts.sig=ACCOUNT_2_ACCOUNTS_SIGNATURE; gld:sess=
 - 默认 `auto` 模式逐个尝试域名；某个域名签到成功或确认今日已签到后立即停止，一个账号只产生一条汇总结果。
 - 临时网络错误、HTTP 429 / 5xx 会有限重试；HTTP 跳转不会自动携带 Cookie 跟随。
 - 新版请求会先获取一次性校验信息；签名请求只提交一次，网络超时后可重新运行工作流获取新的校验信息。
+- 设备不匹配时最多按登录平台恢复一次，每次获取新的校验信息；填写了 `user-agent` 时始终使用该值。
 - 运行时会对 Cookie 以及 `gld:*` / `koa:*` 会话、账户令牌和签名添加日志遮罩。
 - 使用 GitHub 自带的 `GITHUB_TOKEN` 重新启用当前工作流，防止因仓库长期没有提交导致定时任务被停用；无需额外 PAT。
 - 不自动删除运行日志，便于检查历史结果。
@@ -131,6 +133,7 @@ python checkin.py
 
 - **“没有权限” / “No permission”**：Cookie 未通过认证。重新登录对应账号，复制新的 Cookie 并更新 Secret；检查配置域名是否与登录站点一致。
 - **“需要网页验证” / “Automated check-in detected”**：网站要求 Turnstile 或登录设备验证。在对应账号的官网签到页检查；纯 GitHub 接口任务无法代替网页验证。
+- **“登录设备仍不匹配”**：在该账号 JSON 对象中补充 `user-agent`，填写获取 Cookie 时浏览器 Network → Request Headers 中的完整 User-Agent。
 - **“邮箱不一致”**：Cookie 与配置邮箱属于不同账号；核对该对象的 `email` 和 `cookie`。脚本会在提交签到前拒绝这一账号。
 - **“未返回有效邮箱”**：无法确定当前 Cookie 对应的账号，检查 Cookie 是否完整或网站接口是否变更。
 - **“未配置账号”**：检查 Secret 名称与拼写，确认配置在自己的仓库的 Repository Secrets 中。
