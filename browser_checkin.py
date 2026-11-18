@@ -1,6 +1,7 @@
 """Submit through the official check-in page in an isolated browser session."""
 
 import re
+import time
 from urllib.parse import urlsplit
 
 
@@ -28,7 +29,7 @@ def browser_cookies(cookie: str, domain: str) -> list[dict]:
     return cookies
 
 
-def checkin_in_browser(cookie: str, domain: str, expected_email: str, user_agent: str, headless=True) -> dict:
+def checkin_in_browser(cookie: str, domain: str, expected_email: str, user_agent: str, headless=True, submit=True) -> dict:
     """Let the website render its own verification and submit its own request.
 
     No CAPTCHA solver, token synthesis, browser stealth, or browser profile is
@@ -57,6 +58,20 @@ def checkin_in_browser(cookie: str, domain: str, expected_email: str, user_agent
                     context.route(f"{origin}/api/user/stake**", lambda route: route.abort())
                     page = context.new_page()
                     page.set_default_timeout(30_000)
+                    challenge_state = {"required": None}
+
+                    def observe_challenge(response):
+                        target = urlsplit(response.url)
+                        if target.hostname != domain or target.path != "/api/user/checkin/challenge":
+                            return
+                        try:
+                            challenge = response.json()
+                            if isinstance(challenge, dict) and str(challenge.get("code")) == "0":
+                                challenge_state["required"] = bool(challenge.get("turnstile"))
+                        except (ValueError, Error):
+                            pass
+
+                    page.on("response", observe_challenge)
                     page.goto(f"{origin}/console/checkin", wait_until="domcontentloaded", timeout=45_000)
                     if urlsplit(page.url).hostname != domain:
                         raise BrowserCheckinError("签到页面跳转到其他域名；已停止该账号。")
@@ -77,6 +92,22 @@ def checkin_in_browser(cookie: str, domain: str, expected_email: str, user_agent
                     # Allow the official page to load its challenge and widget.
                     # The page itself manages token generation and submission.
                     page.wait_for_timeout(4_000)
+
+                    if not submit:
+                        # Read-only integration check: observe the official
+                        # widget's result without clicking or submitting it.
+                        ready = False
+                        deadline = time.monotonic() + 45
+                        while time.monotonic() < deadline:
+                            if challenge_state["required"] is False:
+                                ready = True
+                                break
+                            field = page.locator('input[name="cf-turnstile-response"]')
+                            if field.count() and field.first.input_value():
+                                ready = True
+                                break
+                            page.wait_for_timeout(1_000)
+                        return {"email_verified": True, "turnstile_required": challenge_state["required"], "verification_ready": ready}
 
                     def is_checkin(response):
                         target = urlsplit(response.url)

@@ -142,6 +142,20 @@ class BrowserTransportTests(unittest.TestCase):
         context.close.assert_called_once()
         browser.close.assert_called_once()
 
+    def test_read_only_probe_observes_widget_without_clicking_or_logging_token(self):
+        _, browser, context, page, manager = self.runtime()
+        page.locator.return_value.count.return_value = 1
+        page.locator.return_value.first.input_value.return_value = "official-widget-token"
+        with patch("playwright.sync_api.sync_playwright", return_value=manager):
+            outcome = checkin_in_browser(COOKIE, "glados.cloud", "one@example.com", "Browser/1.0", submit=False)
+        self.assertTrue(outcome["email_verified"])
+        self.assertTrue(outcome["verification_ready"])
+        self.assertNotIn("official-widget-token", repr(outcome))
+        page.get_by_role.return_value.click.assert_not_called()
+        page.expect_response.assert_not_called()
+        context.close.assert_called_once()
+        browser.close.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

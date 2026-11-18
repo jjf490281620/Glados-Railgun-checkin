@@ -132,6 +132,8 @@ python checkin.py
 
 本地需要启用网页后备流程时，先执行 `python -m playwright install chromium`，再设置 `GLADOS_BROWSER_FALLBACK=true`。默认使用无界面浏览器；需要可见窗口时设置 `GLADOS_BROWSER_HEADLESS=false`。GitHub Actions 使用 Xvfb 运行带界面的 Chromium，配置已包含在工作流中。
 
+需要单独检查 GitHub 浏览器环境时，可手动运行 **Verify GLaDOS browser verification** 工作流，选择复制 Cookie 时的登录设备。该检查为每个账号打开独立会话，核验邮箱并观察官网验证组件是否完成验证，不提交签到或兑换；验证令牌不写入日志或摘要。
+
 测试使用模拟接口，不需要真实 Cookie，不会执行真实签到或推送。
 
 ## 排查问题
