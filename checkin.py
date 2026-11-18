@@ -265,7 +265,9 @@ class CheckinResult:
 
     @property
     def identifier(self) -> str:
-        if self.email and self.email != self.account:
+        if self.email:
+            if self.email.casefold() == self.account.casefold():
+                return self.email
             return f"{self.account} ({self.email})"
         return self.account
 
@@ -394,12 +396,17 @@ def write_summary(title: str, results: list[CheckinResult], error="") -> None:
     lines = [f"## {markdown_cell(title)}", ""]
     if results:
         lines.extend([
-            "| 账号 | 邮箱 | 域名 | 结果 | 本次积分 | 剩余天数 | 总积分 | 说明 |",
-            "| --- | --- | --- | --- | --- | --- | --- | --- |",
+            "| 账号（邮箱） | 域名 | 结果 | 本次积分 | 剩余天数 | 总积分 |",
+            "| --- | --- | --- | --- | --- | --- |",
         ])
         for result in results:
-            values = (result.account, result.email or "未验证", result.domain, result.status, result.points, result.days, result.points_total, result.message)
+            values = (result.identifier, result.domain, result.status, result.points, result.days, result.points_total)
             lines.append("| " + " | ".join(markdown_cell(value) for value in values) + " |")
+        pending = [result for result in results if not result.ok]
+        if pending:
+            lines.extend(["", "**未完成签到的账号**", ""])
+            for result in pending:
+                lines.append(f"- {markdown_cell(result.identifier)}：{markdown_cell(result.message)}")
     if error:
         lines.append(markdown_cell(error))
     lines.extend(["", "今日已签到视为成功。失败账号不会阻止其他账号签到；任一账号失败会使签到任务失败。", ""])
